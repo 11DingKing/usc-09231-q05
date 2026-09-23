@@ -47,8 +47,53 @@ log = logging.getLogger("beets")
 AlbumOrItem = TypeVar("AlbumOrItem", "Album", "Item")
 
 
+class PathResolutionError(ValueError):
+    """Raised when a path rendered from a path template cannot be resolved
+    inside its intended base directory.
+
+    This happens when the rendered fragment traverses outside the base
+    directory (e.g. via ``..`` components left intact by custom
+    replacement rules), so writing the file would place it outside the
+    library.
+    """
+
+
+def _contained_path(basedir: bytes, fragment: bytes) -> bytes:
+    """Join the relative ``fragment`` onto ``basedir`` and verify that the
+    normalized result stays inside the base directory.
+
+    ``fragment`` must already have its leading separators stripped (see
+    `destination`), so it is anchored at ``basedir`` rather than at the
+    filesystem root. A fragment that normalizes to a location outside
+    ``basedir`` (e.g. through ``..`` traversal left intact by custom
+    replacement rules, or onto a different drive on Windows) raises
+    `PathResolutionError`. A result equal to the base directory itself is
+    allowed.
+    """
+    base = normpath(basedir)
+    dest = normpath(os.path.join(base, fragment))
+
+    # The destination is contained when its path relative to the base
+    # directory does not climb above it. Using `relpath` (rather than a
+    # string-prefix check) handles a filesystem-root base directory and
+    # sibling directories sharing a name prefix correctly; on Windows a
+    # different drive letter raises ValueError, which is also an escape.
+    try:
+        relative = os.path.relpath(dest, base)
+    except ValueError:
+        relative = b".."
+    parent_ref = b".." + os.path.sep.encode()
+    if relative == b".." or relative.startswith(parent_ref):
+        raise PathResolutionError(
+            f"path destination {os.fsdecode(dest)!r} resolves outside the "
+            f"base directory {os.fsdecode(base)!r}"
+        )
+
+    return dest
+
+
 class LibModel(dbcore.Model["Library"]):
-    """ . "说明"Shared concrete functionality for Items and Albums.""" . "说明"
+    """Shared concrete functionality for Items and Albums."""
 
     _field_names: ClassVar[set[str]]
 
@@ -63,7 +108,7 @@ class LibModel(dbcore.Model["Library"]):
 
     @cached_classproperty
     def _types(cls) -> dict[str, types.Type]:
-        """ . "说明"Return the types of the fields in this model.""" . "说明"
+        """Return the types of the fields in this model."""
         return {
             **plugins.types(cls),  # type: ignore[arg-type]
             "data_source": TYPE_BY_FIELD["data_source"],
@@ -79,7 +124,7 @@ class LibModel(dbcore.Model["Library"]):
 
     @property
     def filepath(self) -> Path:
-        """ . "说明"The path to the entity as pathlib.Path.""" . "说明"
+        """The path to the entity as pathlib.Path."""
         return Path(os.fsdecode(self.path))
 
     def _template_funcs(self) -> FieldTFuncs:
@@ -136,7 +181,7 @@ class LibModel(dbcore.Model["Library"]):
     def field_query(
         cls, field: str, pattern: str, query_cls: FieldQueryType
     ) -> FieldQuery:
-        """ . "说明"Get a `FieldQuery` for the given field on this model.""" . "说明"
+        """Get a `FieldQuery` for the given field on this model."""
         field = maybe_replace_legacy_field(field, cls is Album)
 
         fast = field in cls.all_db_fields
@@ -177,7 +222,7 @@ class LibModel(dbcore.Model["Library"]):
         )
 
     def duplicates_query(self, fields: list[str]) -> dbcore.AndQuery:
-        """ . "说明"Return a query for entities with same values in the given fields.""" . "说明"
+        """Return a query for entities with same values in the given fields."""
         return dbcore.AndQuery(
             [
                 self.field_query(f, self.get(f), dbcore.MatchQuery)
@@ -187,10 +232,10 @@ class LibModel(dbcore.Model["Library"]):
 
 
 class FormattedItemMapping(dbcore.db.FormattedMapping):
-    """ . "说明"Add lookup for album-level fields.
+    """Add lookup for album-level fields.
 
     Album-level fields take precedence if `for_path` is true.
-    """ . "说明"
+    """
 
     ALL_KEYS = "*"
 
@@ -234,10 +279,10 @@ class FormattedItemMapping(dbcore.db.FormattedMapping):
         return self.item._cached_album
 
     def _get(self, key: str) -> str:
-        """ . "说明"Get the value for a key, either from the album or the item.
+        """Get the value for a key, either from the album or the item.
 
         Raise a KeyError for invalid keys.
-        """ . "说明"
+        """
         if self.album and self.for_path and key in self.album_keys:
             return self._get_formatted(self.album, key)
         if key in self.model_keys:
@@ -247,11 +292,11 @@ class FormattedItemMapping(dbcore.db.FormattedMapping):
         raise KeyError(key)
 
     def __getitem__(self, key: str) -> str:
-        """ . "说明"Get the value for a key.
+        """Get the value for a key.
 
         `artist` and `albumartist` are fallback values for each other
         when not set.
-        """ . "说明"
+        """
         value = self._get(key)
 
         # `artist` and `albumartist` fields fall back to one another.
@@ -275,11 +320,11 @@ class FormattedItemMapping(dbcore.db.FormattedMapping):
 
 
 class Album(LibModel):
-    """ . "说明"Provide access to information about albums stored in a
+    """Provide access to information about albums stored in a
     library.
 
     Reflects the library's "albums" table, including album art.
-    """ . "说明"
+    """
 
     artpath: bytes | None
 
@@ -356,11 +401,11 @@ class Album(LibModel):
 
     @cached_classproperty
     def relation_join(cls) -> str:
-        """ . "说明"Return FROM clause which joins on related album items.
+        """Return FROM clause which joins on related album items.
 
         Use LEFT join to select all albums, including those that do not have
         any items.
-        """ . "说明"
+        """
         return (
             f"LEFT JOIN {cls._relation._table} "
             f"ON {cls._table}.id = {cls._relation._table}.album_id"
@@ -368,7 +413,7 @@ class Album(LibModel):
 
     @property
     def art_filepath(self) -> Path | None:
-        """ . "说明"The path to album's cover picture as pathlib.Path.""" . "说明"
+        """The path to album's cover picture as pathlib.Path."""
         return Path(os.fsdecode(self.artpath)) if self.artpath else None
 
     @classmethod
@@ -382,21 +427,21 @@ class Album(LibModel):
         }
 
     def items(self) -> Results[Item]:  # type: ignore[override]
-        """ . "说明"Return an iterable over the items associated with this
+        """Return an iterable over the items associated with this
         album.
 
         This method conflicts with :meth:`LibModel.items`, which is
         inherited from :meth:`beets.dbcore.Model.items`.
         Since :meth:`Album.items` predates these methods, and is
         likely to be used by plugins, we keep this interface as-is.
-        """ . "说明"
+        """
         if self._db is None:
             raise AttributeError(f"{type(self).__name__} has no database")
 
         return self._db.items(dbcore.MatchQuery("album_id", self.id))
 
     def remove(self, delete: bool = False, with_items: bool = True) -> None:
-        """ . "说明"Remove this album and all its associated items from the
+        """Remove this album and all its associated items from the
         library.
 
         If delete, then the items' files are also deleted from disk,
@@ -404,7 +449,7 @@ class Album(LibModel):
         also removed (recursively) if empty.
 
         Set with_items to False to avoid removing the album's items.
-        """ . "说明"
+        """
         super()._remove()
 
         # Send a 'album_removed' signal to plugins
@@ -426,7 +471,7 @@ class Album(LibModel):
         operation: MoveOperation = MoveOperation.MOVE,
         item_dir: bytes | None = None,
     ) -> None:
-        """ . "说明"Move, copy, link or hardlink (depending on `operation`) any
+        """Move, copy, link or hardlink (depending on `operation`) any
         existing album art so that it remains in the same directory as
         the items.
 
@@ -435,7 +480,7 @@ class Album(LibModel):
         `item_dir` may be provided to specify the target directory for
         the art. If not provided, the directory of the album's first
         item is used.
-        """ . "说明"
+        """
         old_art = self.artpath
         if not old_art:
             return
@@ -485,7 +530,7 @@ class Album(LibModel):
         basedir: bytes | None = None,
         store: bool = True,
     ) -> None:
-        """ . "说明"Move, copy, link or hardlink (depending on `operation`)
+        """Move, copy, link or hardlink (depending on `operation`)
         all items to their destination. Any album art moves along with them.
 
         `basedir` overrides the library base directory for the destination.
@@ -496,7 +541,7 @@ class Album(LibModel):
         modifications to its metadata. If `store` is `False` however,
         the album is not stored automatically, and it will have to be manually
         stored after invoking this method.
-        """ . "说明"
+        """
         basedir = basedir or self.db.directory
 
         # Ensure new metadata is available to items for destination
@@ -519,16 +564,16 @@ class Album(LibModel):
             self.store()
 
     def item_dir(self) -> bytes:
-        """ . "说明"Return the directory containing the album's first item,
+        """Return the directory containing the album's first item,
         provided that such an item exists.
-        """ . "说明"
+        """
         item = self.items().get()
         if not item:
             raise ValueError(f"empty album for album id {self.id}")
         return os.path.dirname(item.path)
 
     def _albumtotal(self) -> int:
-        """ . "说明"Return the total number of tracks on all discs on the album.""" . "说明"
+        """Return the total number of tracks on all discs on the album."""
         if self.disctotal == 1 or not beets.config["per_disc_numbering"]:
             return self.items()[0].tracktotal
 
@@ -550,7 +595,7 @@ class Album(LibModel):
     def art_destination(
         self, image: bytes, item_dir: bytes | None = None
     ) -> bytes:
-        """ . "说明"Return a path to the destination for the album art image
+        """Return a path to the destination for the album art image
         for the album.
 
         `image` is the path of the image that will be
@@ -559,7 +604,7 @@ class Album(LibModel):
         The path construction uses the existing path of the album's
         items, so the album must contain at least one item or
         item_dir must be provided.
-        """ . "说明"
+        """
         image = bytestring_path(image)
         item_dir = item_dir or self.item_dir()
 
@@ -576,13 +621,13 @@ class Album(LibModel):
         return bytestring_path(dest)
 
     def set_art(self, path: bytes, copy: bool = True) -> None:
-        """ . "说明"Set the album's cover art to the image at the given path.
+        """Set the album's cover art to the image at the given path.
 
         The image is copied (or moved) into place, replacing any
         existing art.
 
         Send an 'art_set' event with `self` as the sole argument.
-        """ . "说明"
+        """
         path = bytestring_path(path)
         oldart = self.artpath
         artdest = self.art_destination(path)
@@ -610,7 +655,7 @@ class Album(LibModel):
     def store(
         self, fields: Iterable[str] | None = None, inherit: bool = True
     ) -> None:
-        """ . "说明"Update the database with the album information.
+        """Update the database with the album information.
 
         `fields` represents the fields to be stored. If not specified,
         all fields will be.
@@ -618,7 +663,7 @@ class Album(LibModel):
         The album's tracks are also updated when the `inherit` flag is enabled.
         This applies to fixed attributes as well as flexible ones. The `id`
         attribute of the album will never be inherited.
-        """ . "说明"
+        """
         # Get modified track fields.
         track_updates = {}
         track_deletes = set()
@@ -648,26 +693,26 @@ class Album(LibModel):
                     item.store()
 
     def try_sync(self, write: bool, move: bool, inherit: bool = True) -> None:
-        """ . "说明"Synchronize the album and its items with the database.
+        """Synchronize the album and its items with the database.
         Optionally, also write any new tags into the files and update
         their paths.
 
         `write` indicates whether to write tags to the item files, and
         `move` controls whether files (both audio and album art) are
         moved.
-        """ . "说明"
+        """
         self.store(inherit=inherit)
         for item in self.items():
             item.try_sync(write, move)
 
     @cached_property
     def length(self) -> float:  # type: ignore[override] # still writable since we override __setattr__
-        """ . "说明"Return the total length of all items in this album in seconds.""" . "说明"
+        """Return the total length of all items in this album in seconds."""
         return sum(item.length for item in self.items())
 
 
 class Item(LibModel):
-    """ . "说明"Represent a song or track.""" . "说明"
+    """Represent a song or track."""
 
     album_id: int | None
 
@@ -774,11 +819,11 @@ class Item(LibModel):
 
     @cached_classproperty
     def relation_join(cls) -> str:
-        """ . "说明"Return the FROM clause which includes related albums.
+        """Return the FROM clause which includes related albums.
 
         We need to use a LEFT JOIN here, otherwise items that are not part of
         an album (e.g. singletons) would be left out.
-        """ . "说明"
+        """
         return (
             f"LEFT JOIN {cls._relation._table} "
             f"ON {cls._table}.album_id = {cls._relation._table}.id"
@@ -786,14 +831,14 @@ class Item(LibModel):
 
     @property
     def _cached_album(self) -> Album | None:
-        """ . "说明"The Album object that this item belongs to, if any, or
+        """The Album object that this item belongs to, if any, or
         None if the item is a singleton or is not associated with a
         library.
         The instance is cached and refreshed on access.
 
         DO NOT MODIFY!
         If you want a copy to modify, use :meth:`get_album`.
-        """ . "说明"
+        """
         if not self.__album and self._db:
             self.__album = self._db.get_album(self)
         elif self.__album:
@@ -814,14 +859,14 @@ class Item(LibModel):
         }
 
     def duplicates_query(self, fields: list[str]) -> dbcore.AndQuery:
-        """ . "说明"Return a query for entities with same values in the given fields.""" . "说明"
+        """Return a query for entities with same values in the given fields."""
         return super().duplicates_query(fields) & dbcore.query.NoneQuery(
             "album_id"
         )
 
     @classmethod
     def from_path(cls, path: util.PathLike) -> Self:
-        """ . "说明"Create a new item from the media file at the specified path.""" . "说明"
+        """Create a new item from the media file at the specified path."""
         # Initiate with values that aren't read from files.
         i = cls(album_id=None)
         i.read(path)
@@ -829,7 +874,7 @@ class Item(LibModel):
         return i
 
     def __setitem__(self, key: str, value: Any) -> None:
-        """ . "说明"Set the item's value for a standard field or a flexattr.""" . "说明"
+        """Set the item's value for a standard field or a flexattr."""
         # Encode unicode paths and read buffers.
         if key == "path":
             if isinstance(value, str):
@@ -845,11 +890,11 @@ class Item(LibModel):
             self.mtime = 0  # Reset mtime on dirty.
 
     def __getitem__(self, key: str) -> Any:
-        """ . "说明"Get the value for a field, falling back to the album if
+        """Get the value for a field, falling back to the album if
         necessary.
 
         Raise a KeyError if the field is not available.
-        """ . "说明"
+        """
         try:
             return super().__getitem__(key)
         except KeyError:
@@ -869,10 +914,10 @@ class Item(LibModel):
     def keys(
         self, computed: bool = False, with_album: bool = True
     ) -> KeysView[str]:
-        """ . "说明"Get a list of available field names.
+        """Get a list of available field names.
 
         `with_album` controls whether the album's fields are included.
-        """ . "说明"
+        """
         keys: set[str] = set(super().keys(computed=computed))
         if with_album and self._cached_album:
             keys |= self._cached_album.keys(computed=computed)
@@ -882,11 +927,11 @@ class Item(LibModel):
     def get(
         self, key: str, default: Any = None, with_album: bool = True
     ) -> Any:
-        """ . "说明"Get the value for a given key or `default` if it does not
+        """Get the value for a given key or `default` if it does not
         exist.
 
         Set `with_album` to false to skip album fallback.
-        """ . "说明"
+        """
         try:
             return self._get(key, default, raise_=with_album)
         except KeyError:
@@ -895,24 +940,24 @@ class Item(LibModel):
             return default
 
     def update(self, values: Mapping[str, Any]) -> None:
-        """ . "说明"Set all key/value pairs in the mapping.
+        """Set all key/value pairs in the mapping.
 
         If mtime is specified, it is not reset (as it might otherwise be).
-        """ . "说明"
+        """
         super().update(values)
         if self.mtime == 0 and "mtime" in values:
             self.mtime = values["mtime"]
 
     def clear(self) -> None:
-        """ . "说明"Set all key/value pairs to None.""" . "说明"
+        """Set all key/value pairs to None."""
         for key in self._media_tag_fields:
             setattr(self, key, None)
 
     def get_album(self) -> Album | None:
-        """ . "说明"Get the Album object that this item belongs to, if any, or
+        """Get the Album object that this item belongs to, if any, or
         None if the item is a singleton or is not associated with a
         library.
-        """ . "说明"
+        """
         if not self._db:
             return None
         return self._db.get_album(self)
@@ -920,14 +965,14 @@ class Item(LibModel):
     # Interaction with file metadata.
 
     def read(self, read_path: util.PathLike | None = None) -> None:
-        """ . "说明"Read the metadata from the associated file.
+        """Read the metadata from the associated file.
 
         If `read_path` is specified, read metadata from that file
         instead. Update all the properties in `_media_fields`
         from the media file.
 
         Raise a `ReadError` if the file could not be read.
-        """ . "说明"
+        """
         if read_path is None:
             read_path = self.path
         else:
@@ -956,7 +1001,7 @@ class Item(LibModel):
         tags: Mapping[str, Any] | None = None,
         id3v23: bool | None = None,
     ) -> None:
-        """ . "说明"Write the item's metadata to a media file.
+        """Write the item's metadata to a media file.
 
         All fields in `_media_fields` are written to disk according to
         the values on this object.
@@ -971,7 +1016,7 @@ class Item(LibModel):
         set to something other than `None`.
 
         Can raise either a `ReadError` or a `WriteError`.
-        """ . "说明"
+        """
         if path is None:
             path = self.path
         else:
@@ -1013,11 +1058,11 @@ class Item(LibModel):
         tags: Mapping[str, Any] | None = None,
         id3v23: bool | None = None,
     ) -> bool:
-        """ . "说明"Call `write()` but catch and log `FileOperationError`
+        """Call `write()` but catch and log `FileOperationError`
         exceptions.
 
         Return `False` an exception was caught and `True` otherwise.
-        """ . "说明"
+        """
         try:
             self.write(path=path, tags=tags, id3v23=id3v23)
             return True
@@ -1028,7 +1073,7 @@ class Item(LibModel):
     def try_sync(
         self, write: bool, move: bool, with_album: bool = True
     ) -> None:
-        """ . "说明"Synchronize the item with the database and, possibly, update its
+        """Synchronize the item with the database and, possibly, update its
         tags on disk and its path (by moving the file).
 
         `write` indicates whether to write new tags into the file. Similarly,
@@ -1038,7 +1083,7 @@ class Item(LibModel):
 
         Similar to calling :meth:`write`, :meth:`move`, and :meth:`store`
         (conditionally).
-        """ . "说明"
+        """
         if write:
             self.try_write()
         if move:
@@ -1053,13 +1098,13 @@ class Item(LibModel):
     def move_file(
         self, dest: bytes, operation: MoveOperation = MoveOperation.MOVE
     ) -> None:
-        """ . "说明"Move, copy, link or hardlink the item depending on `operation`,
+        """Move, copy, link or hardlink the item depending on `operation`,
         updating the path value if the move succeeds.
 
         If a file exists at `dest`, then it is slightly modified to be unique.
 
         `operation` should be an instance of `util.MoveOperation`.
-        """ . "说明"
+        """
         if not util.samefile(self.path, dest):
             dest = util.unique_path(dest)
         if operation == MoveOperation.MOVE:
@@ -1105,16 +1150,16 @@ class Item(LibModel):
         self.path = dest
 
     def current_mtime(self) -> int:
-        """ . "说明"Return the current mtime of the file, rounded to the nearest
+        """Return the current mtime of the file, rounded to the nearest
         integer.
-        """ . "说明"
+        """
         return int(os.path.getmtime(syspath(self.path)))
 
     def try_filesize(self) -> int:
-        """ . "说明"Get the size of the underlying file in bytes.
+        """Get the size of the underlying file in bytes.
 
         If the file is missing, return 0 (and log a warning).
-        """ . "说明"
+        """
         try:
             return os.path.getsize(syspath(self.path))
         except (OSError, Exception) as exc:
@@ -1122,11 +1167,11 @@ class Item(LibModel):
             return 0
 
     def has_cover_art(self) -> bool:
-        """ . "说明"Check if item has embedded cover art.
+        """Check if item has embedded cover art.
 
         Return True if images embedded in file, False otherwise.
         If file unreadable or no images, return False.
-        """ . "说明"
+        """
         with suppress(OSError):
             return bool(MediaFile(self.path).images)
 
@@ -1135,13 +1180,13 @@ class Item(LibModel):
     # Model methods.
 
     def remove(self, delete: bool = False, with_album: bool = True) -> None:
-        """ . "说明"Remove the item.
+        """Remove the item.
 
         If `delete`, then the associated file is removed from disk.
 
         If `with_album`, then the item's album (if any) is removed
         if the item was the last in the album.
-        """ . "说明"
+        """
         super()._remove()
 
         # Remove the album if it is empty.
@@ -1171,7 +1216,7 @@ class Item(LibModel):
         with_album: bool = True,
         store: bool = True,
     ) -> None:
-        """ . "说明"Move the item to its designated location within the library
+        """Move the item to its designated location within the library
         directory (provided by destination()).
 
         Subdirectories are created as needed. If the operation succeeds,
@@ -1191,7 +1236,7 @@ class Item(LibModel):
         as a side effect.
         If `store` is `False` however, the item won't be stored and it will
         have to be manually stored after invoking this method.
-        """ . "说明"
+        """
         dest = self.destination(basedir=basedir)
 
         # If the source file is missing, skip the move.
@@ -1244,14 +1289,14 @@ class Item(LibModel):
         path_formats: list[PathFormat] | None = None,
         extension: str | None = None,
     ) -> bytes:
-        """ . "说明"Return the path in the library directory designated for the item
+        """Return the path in the library directory designated for the item
         (i.e., where the file ought to be).
 
         The path is returned as a bytestring. ``basedir`` can override the
         library's base directory for the destination. If ``relative_to_libdir``
         is true, returns just the fragment of the path underneath the library
         base directory.
-        """ . "说明"
+        """
         basedir = basedir or self.db.directory
         path_formats = path_formats or self.db.path_formats
 
@@ -1292,53 +1337,58 @@ class Item(LibModel):
             )
         lib_path_bytes = util.bytestring_path(lib_path_str)
 
+        # Anchor the fragment inside the base directory, rejecting results
+        # that normalize outside it (see `_contained_path`).
+        fragment = lib_path_bytes.lstrip(
+            (os.path.sep + (os.path.altsep or "")).encode()
+        )
+        dest = _contained_path(basedir, fragment)
         if relative_to_libdir:
-            return lib_path_bytes
-
-        return normpath(os.path.join(basedir, lib_path_bytes))
+            return fragment
+        return dest
 
 
 def _int_arg(s: str) -> int:
-    """ . "说明"Convert a string argument to an integer for use in a template
+    """Convert a string argument to an integer for use in a template
     function.
 
     May raise a ValueError.
-    """ . "说明"
+    """
     return int(s.strip())
 
 
 class DefaultTemplateFunctions:
-    """ . "说明"A container class for the default functions provided to path
+    """A container class for the default functions provided to path
     templates.
 
     These functions are contained in an object to provide
     additional context to the functions -- specifically, the Item being
     evaluated.
-    """ . "说明"
+    """
 
     _prefix = "tmpl_"
 
     @cached_classproperty
     def _func_names(cls) -> list[str]:
-        """ . "说明"Names of tmpl_* functions in this class.""" . "说明"
+        """Names of tmpl_* functions in this class."""
         return [s for s in dir(cls) if s.startswith(cls._prefix)]
 
     def __init__(self, item: LibModel, lib: Library | None) -> None:
-        """ . "说明"Parametrize the functions.
+        """Parametrize the functions.
 
         If `item` or `lib` is None, then some functions (namely, ``aunique``)
         will always evaluate to the empty string.
-        """ . "说明"
+        """
         self.item = item
         self.lib = lib
 
     def functions(self) -> dict[str, Callable[..., object]]:
-        """ . "说明"Return a dictionary containing the functions defined in this
+        """Return a dictionary containing the functions defined in this
         object.
 
         The keys are function names (as exposed in templates)
         and the values are Python functions.
-        """ . "说明"
+        """
         out = {}
         for key in self._func_names:
             out[key[len(self._prefix) :]] = getattr(self, key)
@@ -1346,39 +1396,39 @@ class DefaultTemplateFunctions:
 
     @staticmethod
     def tmpl_lower(s: str) -> str:
-        """ . "说明"Convert a string to lower case.""" . "说明"
+        """Convert a string to lower case."""
         return s.lower()
 
     @staticmethod
     def tmpl_upper(s: str) -> str:
-        """ . "说明"Convert a string to upper case.""" . "说明"
+        """Convert a string to upper case."""
         return s.upper()
 
     @staticmethod
     def tmpl_capitalize(s: str) -> str:
-        """ . "说明"Converts to a capitalized string.""" . "说明"
+        """Converts to a capitalized string."""
         return s.capitalize()
 
     @staticmethod
     def tmpl_title(s: str) -> str:
-        """ . "说明"Convert a string to title case.""" . "说明"
+        """Convert a string to title case."""
         return string.capwords(s)
 
     @staticmethod
     def tmpl_left(s: str, chars: str) -> str:
-        """ . "说明"Get the leftmost characters of a string.""" . "说明"
+        """Get the leftmost characters of a string."""
         return s[0 : _int_arg(chars)]
 
     @staticmethod
     def tmpl_right(s: str, chars: str) -> str:
-        """ . "说明"Get the rightmost characters of a string.""" . "说明"
+        """Get the rightmost characters of a string."""
         return s[-_int_arg(chars) :]
 
     @staticmethod
     def tmpl_if(condition: str, trueval: str, falseval: str = "") -> str:
-        """ . "说明"If ``condition`` is nonempty and nonzero, emit ``trueval``;
+        """If ``condition`` is nonempty and nonzero, emit ``trueval``;
         otherwise, emit ``falseval`` (if provided).
-        """ . "说明"
+        """
         _condition: str | int = condition
         try:
             _condition = _int_arg(condition)
@@ -1390,12 +1440,12 @@ class DefaultTemplateFunctions:
 
     @staticmethod
     def tmpl_asciify(s: str) -> str:
-        """ . "说明"Translate non-ASCII characters to their ASCII equivalents.""" . "说明"
+        """Translate non-ASCII characters to their ASCII equivalents."""
         return util.asciify_path(s)
 
     @staticmethod
     def tmpl_time(s: str, fmt: str) -> str:
-        """ . "说明"Format a time value using `strftime`.""" . "说明"
+        """Format a time value using `strftime`."""
         cur_fmt = beets.config["time_format"].as_str()
         return time.strftime(fmt, time.strptime(s, cur_fmt))
 
@@ -1405,7 +1455,7 @@ class DefaultTemplateFunctions:
         disam: str | None = None,
         bracket: str | None = None,
     ) -> str:
-        """ . "说明"Generate a string that is guaranteed to be unique among all
+        """Generate a string that is guaranteed to be unique among all
         albums in the library who share the same set of keys.
 
         A fields from "disam" is used in the string if one is sufficient to
@@ -1414,7 +1464,7 @@ class DefaultTemplateFunctions:
         whitespace-separated lists of field names, while "bracket" is a
         pair of characters to be used as brackets surrounding the
         disambiguator or empty to have no brackets.
-        """ . "说明"
+        """
         # Fast paths: no album, no item or library, or memoized value.
         if not self.item or not self.lib:
             return ""
@@ -1452,7 +1502,7 @@ class DefaultTemplateFunctions:
         disam: str | None = None,
         bracket: str | None = None,
     ) -> str:
-        """ . "说明"Generate a string that is guaranteed to be unique among all
+        """Generate a string that is guaranteed to be unique among all
         singletons in the library who share the same set of keys.
 
         A fields from "disam" is used in the string if one is sufficient to
@@ -1461,7 +1511,7 @@ class DefaultTemplateFunctions:
         whitespace-separated lists of field names, while "bracket" is a
         pair of characters to be used as brackets surrounding the
         disambiguator or empty to have no brackets.
-        """ . "说明"
+        """
         # Fast paths: no album, no item or library, or memoized value.
         if not self.item or not self.lib:
             return ""
@@ -1492,9 +1542,9 @@ class DefaultTemplateFunctions:
         disam: str | None,
         item_id: int | None,
     ) -> tuple[str | None, str | None, str | None, int | None]:
-        """ . "说明"Get the memokey for the unique template named "name" for the
+        """Get the memokey for the unique template named "name" for the
         specific parameters.
-        """ . "说明"
+        """
         return (name, keys, disam, item_id)
 
     def _tmpl_unique(
@@ -1507,7 +1557,7 @@ class DefaultTemplateFunctions:
         db_item: LibModel,
         skip_item: Callable[[LibModel], bool],
     ) -> str:
-        """ . "说明"Generate a string that is guaranteed to be unique among all items of
+        """Generate a string that is guaranteed to be unique among all items of
         the same type as "db_item" who share the same set of keys.
 
         A field from "disam" is used in the string if one is sufficient to
@@ -1526,7 +1576,7 @@ class DefaultTemplateFunctions:
 
         "initial_subqueries" is a list of subqueries that should be included
         in the query to find the ambiguous items.
-        """ . "说明"
+        """
         lib = self.lib
         if lib is None:
             return ""
@@ -1603,7 +1653,7 @@ class DefaultTemplateFunctions:
         sep: str = "; ",
         join_str: str = "; ",
     ) -> str:
-        """ . "说明"Get the item(s) from x to y in a string separated by something
+        """Get the item(s) from x to y in a string separated by something
         and join then with something.
 
         Args:
@@ -1612,7 +1662,7 @@ class DefaultTemplateFunctions:
             skip: The number of items skipped
             sep: the separator
             join_str: the string which will join the items
-        """ . "说明"
+        """
         skip = int(skip)
         count = skip + int(count)
         return join_str.join(s.split(sep)[skip:count])
@@ -1620,7 +1670,7 @@ class DefaultTemplateFunctions:
     def tmpl_ifdef(
         self, field: str, trueval: str = "", falseval: str = ""
     ) -> str:
-        """ . "说明"If field exists return trueval or the field (default)
+        """If field exists return trueval or the field (default)
         otherwise, emit return falseval (if provided).
 
         Args:
@@ -1630,7 +1680,7 @@ class DefaultTemplateFunctions:
 
         Returns:
             The string, based on condition.
-        """ . "说明"
+        """
         if field in self.item:
             return trueval if trueval else self.item.formatted().get(field)
         return falseval
