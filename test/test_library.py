@@ -1,4 +1,4 @@
-""" . "说明"Tests for non-query database functions of Item.""" . "说明"
+"""Tests for non-query database functions of Item."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ import beets.dbcore.query
 import beets.library
 from beets import config, plugins, util
 from beets.library import Album
+from beets.library.models import DestinationOutsideBaseError
 from beets.test import _common
 from beets.test._common import item
 from beets.test.helper import TestHelper
@@ -29,7 +30,7 @@ np = util.normpath
 
 class PytestItemHelper(TestHelper):
     def get_first_item(self):
-        """ . "说明"Retrieve first item from library.""" . "说明"
+        """Retrieve first item from library."""
         return next(iter(self.lib.items()))
 
     @pytest.fixture
@@ -127,7 +128,7 @@ class TestAdd(PytestItemHelper):
     def test_library_add_one_database_change_event(
         self, item, caplog: pytest.LogCaptureFixture
     ):
-        """ . "说明"Test library.add emits only one database_change event.""" . "说明"
+        """Test library.add emits only one database_change event."""
 
         item.path = beets.util.normpath(self.temp_path / "a" / "b.mp3")
         item.album = "a"
@@ -178,7 +179,7 @@ class TestGetSet(PytestItemHelper):
 
 
 class TestDestination(PytestItemHelper):
-    """ . "说明"Confirm tests handle temporary directory path containing '.'""" . "说明"
+    """Confirm tests handle temporary directory path containing '.'"""
 
     def create_temp_dir(self, **kwargs):
         kwargs["prefix"] = "."
@@ -461,6 +462,157 @@ class TestDestination(PytestItemHelper):
         item_in_db.album = "bar"
         assert item_in_db.destination() == np("base/ber/foo")
 
+    def test_destination_stays_in_basedir_with_empty_leading_field(
+        self, item_in_db
+    ):
+        # Regression test for #4889: an empty leading template field
+        # combined with custom replacements that lack the default
+        # separator rule must not produce an absolute path that escapes
+        # the base directory.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"a"), "e")]
+        self.lib.path_formats = [("default", "$album/$title")]
+        item_in_db.album = ""
+        item_in_db.albumartist = ""
+        item_in_db.artist = ""
+        item_in_db.title = "three"
+        assert item_in_db.destination() == np("base/three")
+
+    def test_destination_strips_multiple_empty_leading_fields(
+        self, item_in_db
+    ):
+        # Several empty leading fields leave a run of leading separators;
+        # none of them may re-anchor the path at the filesystem root.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"a"), "e")]
+        self.lib.path_formats = [
+            ("default", "$album/$artist/$albumartist/$title")
+        ]
+        item_in_db.album = ""
+        item_in_db.artist = ""
+        item_in_db.albumartist = ""
+        item_in_db.title = "three"
+        assert item_in_db.destination() == np("base/three")
+
+    def test_destination_relative_strips_empty_leading_field(self, item_in_db):
+        # The relative fragment must not carry a leading separator either.
+        self.lib.replacements = [(re.compile(r"a"), "e")]
+        self.lib.path_formats = [("default", "$album/$title")]
+        item_in_db.album = ""
+        item_in_db.title = "three"
+        assert item_in_db.destination(relative_to_libdir=True) == b"three"
+
+    def test_destination_strips_literal_leading_separator(self, item_in_db):
+        # A literal leading separator in the template behaves the same as
+        # an empty leading field once replacements leave it intact.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        self.lib.path_formats = [("default", "/$title")]
+        item_in_db.title = "three"
+        assert item_in_db.destination() == np("base/three")
+
+    def test_destination_strips_literal_leading_alt_separator(self, item_in_db):
+        # The other platform's separator must not survive and re-anchor
+        # the path when os.path is mocked for Windows.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        self.lib.path_formats = [("default", "\\$title")]
+        item_in_db.title = "three"
+        with _common.platform_windows():
+            dest = item_in_db.destination()
+            assert os.path.basename(dest) == b"three"
+            assert b"base" in dest
+
+    def test_destination_preserves_nested_directories(self, item_in_db):
+        # Empty leading fields are collapsed, but legitimate nested
+        # directories keep their structure and separators.
+        self.lib.directory = b"base"
+        self.lib.path_formats = [
+            ("default", "$albumartist/$album/$track $title")
+        ]
+        item_in_db.albumartist = "one"
+        item_in_db.album = "two"
+        item_in_db.track = 3
+        item_in_db.title = "four"
+        assert item_in_db.destination() == np("base/one/two/03 four")
+
+    def test_destination_allows_dotdot_that_stays_inside(self, item_in_db):
+        # A `..` component that merely cancels a real component is legal.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        self.lib.path_formats = [("default", "one/../$title")]
+        item_in_db.title = "three"
+        assert item_in_db.destination() == np("base/three")
+
+    def test_destination_rejects_dotdot_escaping_basedir(self, item_in_db):
+        # A leading `..` that resolves outside the base directory must be
+        # rejected rather than written there.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        self.lib.path_formats = [("default", "../$title")]
+        item_in_db.title = "three"
+        with pytest.raises(DestinationOutsideBaseError):
+            item_in_db.destination()
+
+    def test_destination_rejects_dotdot_after_nesting(self, item_in_db):
+        # Enough `..` components to climb back past the base are rejected,
+        # even when they appear after legitimate nesting.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        self.lib.path_formats = [("default", "one/two/../../../$title")]
+        item_in_db.title = "three"
+        with pytest.raises(DestinationOutsideBaseError):
+            item_in_db.destination()
+
+    def test_destination_rejects_escape_under_windows(self, item_in_db):
+        # Both `..` traversal and a drive-qualified fragment must be
+        # rejected when paths are interpreted as Windows paths.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        item_in_db.title = "evil"
+        with _common.platform_windows():
+            self.lib.path_formats = [("default", "../$title")]
+            with pytest.raises(DestinationOutsideBaseError):
+                item_in_db.destination()
+            self.lib.path_formats = [("default", "C:\\$title")]
+            with pytest.raises(DestinationOutsideBaseError):
+                item_in_db.destination()
+
+    def test_destination_basedir_prefix_is_not_escaped(self, item_in_db):
+        # A sibling directory that merely shares a name prefix with the
+        # base must not be mistaken for being inside it.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        self.lib.path_formats = [("default", "../base2/$title")]
+        item_in_db.title = "three"
+        with pytest.raises(DestinationOutsideBaseError):
+            item_in_db.destination()
+
+    def test_art_destination_rejects_escape(self, item_in_db):
+        # Album art must be anchored in the item directory just like
+        # items are anchored in the library directory. A traversal in the
+        # art filename is rejected.
+        self.lib.directory = b"base"
+        self.lib.replacements = [(re.compile(r"zzz"), "zzz")]
+        item_in_db.path = np("base/album/song.mp3")
+        album = self.lib.add_album([item_in_db])
+        item_dir = os.path.dirname(item_in_db.path)
+        config["art_filename"] = "../cover"
+        with pytest.raises(DestinationOutsideBaseError):
+            album.art_destination(b"image.jpg", item_dir=item_dir)
+
+    def test_art_destination_allows_nested(self, item_in_db):
+        # Legitimate art placement inside the item directory continues to
+        # work and keeps the configured filename and extension.
+        self.lib.directory = b"base"
+        item_in_db.path = np("base/album/song.mp3")
+        album = self.lib.add_album([item_in_db])
+        item_dir = os.path.dirname(item_in_db.path)
+        config["art_filename"] = "cover"
+        art = album.art_destination(b"image.jpg", item_dir=item_dir)
+        assert os.path.dirname(art) == item_dir
+        assert os.path.basename(art) == b"cover.jpg"
+
     @unittest.skip("unimplemented: #359")
     def test_destination_with_empty_component(self, item_in_db):
         self.lib.directory = b"base"
@@ -560,7 +712,7 @@ class TestItemFormattedMapping(PytestItemHelper):
 
 
 class PathFormattingMixin:
-    """ . "说明"Utilities for testing path formatting.""" . "说明"
+    """Utilities for testing path formatting."""
 
     lib: beets.library.Library
 
@@ -1059,9 +1211,9 @@ class TestPathString(PytestItemHelper):
 
     def test_unicode_in_database_becomes_bytestring(self, item_in_db):
         self.lib._connection().execute(
-            """ . "说明"
+            """
         update items set path=? where id=?
-        """ . "说明",
+        """,
             (item_in_db.id, "somepath"),
         )
         assert isinstance(self.get_first_item().path, bytes)
@@ -1315,7 +1467,7 @@ class TestItemRead(PytestItemHelper):
 
 class TestItemReadGenre(TestHelper):
     def test_read_semicolon_delimited_genres(self):
-        """ . "说明"Semicolon-delimited genre tags are split into individual genres on read.""" . "说明"
+        """Semicolon-delimited genre tags are split into individual genres on read."""
         path = self.create_mediafile_fixture()
         mf = MediaFile(path)
         mf.genres = ["Jazz; Funk; Soul"]
@@ -1335,16 +1487,16 @@ class TestFilesize(TestHelper):
 
 
 class TestItemPruneDirsClutter(TestHelper):
-    """ . "说明"Regression tests: prune_dirs respects config["clutter"] during move/remove.""" . "说明"
+    """Regression tests: prune_dirs respects config["clutter"] during move/remove."""
 
     def _drop_clutter(self, directory: Path) -> Path:
-        """ . "说明"Create a clutter file in *directory* (bytes path).""" . "说明"
+        """Create a clutter file in *directory* (bytes path)."""
         path = directory / "unwanted.log"
         path.touch()
         return path
 
     def test_move_prunes_dir_with_config_clutter(self):
-        """ . "说明"After moving an item, old dir is removed even when only clutter remains.""" . "说明"
+        """After moving an item, old dir is removed even when only clutter remains."""
         config["clutter"] = ["*.log"]
         item = self.add_item_fixture()
         old_dir = item.filepath.parent
@@ -1358,7 +1510,7 @@ class TestItemPruneDirsClutter(TestHelper):
         assert not old_dir.exists()
 
     def test_remove_prunes_dir_with_config_clutter(self):
-        """ . "说明"After deleting an item, its dir is removed even when only clutter remains.""" . "说明"
+        """After deleting an item, its dir is removed even when only clutter remains."""
         config["clutter"] = ["*.log"]
         item = self.add_item_fixture()
         old_dir = item.filepath.parent
